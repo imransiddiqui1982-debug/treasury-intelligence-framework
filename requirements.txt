@@ -1,0 +1,232 @@
+"""
+tif.liquidity.hqla_projection
+==============================
+HQLA (High Quality Liquid Asset) balance projection using Facebook Prophet
+for time-series decomposition, with duration-adjusted rate shock overlays.
+
+Supports L1, L2A, and L2B asset tiers with Basel III haircut treatment.
+
+Reference
+---------
+Siddiqui, I. (2025). Predictive LCR Modeling for Regional Banks.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+try:
+    from prophet import Prophet
+    _PROPHET_OK = True
+except ImportError:
+    _PROPHET_OK = False
+
+
+# ── Basel III HQLA haircuts ───────────────────────────────────────────────────
+HQLA_HAIRCUTS: Dict[str, float] = {
+    "L1_coins_banknotes":      0.00,
+    "L1_central_bank_reserves":0.00,
+    "L1_sovereign_0pct_rw":   0.00,
+    "L2A_sovereign_20pct_rw": 0.15,
+    "L2A_covered_bonds":      0.15,
+    "L2A_corporate_bonds_AA": 0.15,
+    "L2B_rmbs":               0.25,
+    "L2B_corporate_bonds_A":  0.50,
+    "L2B_equities":           0.50,
+}
+
+L2A_CAP = 0.40   # L2A <= 40% of total HQLA
+L2B_CAP = 0.15   # L2B <= 15% of total HQLA after haircuts
+
+
+@dataclass
+class RateScenario:
+    """Interest rate scenario for HQLA fair value stress."""
+    label: str
+    parallel_shift_bps: float    # e.g. +200 or -100
+    twist_bps: float = 0.0       # steepener (+) or flattener (-)
+    credit_shock_bps: float = 0.0 # additional credit spread widening
+
+
+@dataclass
+class HQLAPosition:
+    """Single HQLA position."""
+    asset_type: str              # key in HQLA_HAIRCUTS
+    balance_usd_m: float         # USD millions, market value
+    duration_years: float        # modified duration
+    convexity: float = 0.0       # dollar convexity
+
+
+@dataclass
+class HQLAProjectionResult:
+    """Output of HQLA projection for one scenario."""
+    scenario: str
+    horizon_days: int
+    dates: List[str]
+    l1_projected: List[float]
+    l2a_projected: List[float]
+    l2b_projected: List[float]
+    total_hqla: List[float]
+    rate_haircut_pct: List[float]  # additional haircut from rate shock
+
+
+class HQLAProjection:
+    """
+    Project HQLA balance and eligible value over a forward horizon.
+
+    Uses Prophet for trend/seasonality decomposition, then applies
+    duration-adjusted mark-to-market impact under each RateScenario.
+
+    Parameters
+    ----------
+    horizon_days : int
+        Forward projection horizon (default: 60 days).
+    seasonality_mode : str
+        Prophet seasonality mode — 'additive' or 'multiplicative'.
+
+    Examples
+    --------
+    >>> proj = HQLAProjection(horizon_days=30)
+    >>> proj.fit(history_df)
+    >>> results = proj.project(positions, scenarios)
+    """
+
+    def __init__(
+        self,
+        horizon_days: int = 60,
+        seasonality_mode: str = "additive",
+    ) -> None:
+        if not _PROPHET_OK:
+            raise ImportError("Install: prophet")
+        self.horizon_days     = horizon_days
+        self.seasonality_mode = seasonality_mode
+        self._models: Dict[str, Prophet] = {}
+        self._is_fitted = False
+
+    def fit(self, history: pd.DataFrame) -> "HQLAProjection":
+        """
+        Fit Prophet models to each HQLA tier.
+
+        Parameters
+        ----------
+        history : pd.DataFrame
+            Columns: date, l1_balance, l2a_balance, l2b_balance (USD millions).
+        """
+        for col in ["l1_balance", "l2a_balance", "l2b_balance"]:
+            df_fit = history[["date", col]].rename(columns={"date": "ds", col: "y"})
+            df_fit["y"] = df_fit["y"].clip(lower=0)
+            m = Prophet(
+                changepoint_prior_scale=0.05,
+                seasonality_mode=self.seasonality_mode,
+                weekly_seasonality=True,
+                yearly_seasonality=True,
+                daily_seasonality=False,
+            )
+            m.add_seasonality(name="monthly", period=30.5, fourier_order=3)
+            m.fit(df_fit)
+            self._models[col] = m
+        self._is_fitted = True
+        return self
+
+    def _apply_rate_shock(
+        self,
+        balance: float,
+        duration: float,
+        convexity: float,
+        shock_bps: float,
+    ) -> float:
+        """Duration-convexity approximation of fair value change."""
+        dr = shock_bps / 10_000
+        pct_chg = -duration * dr + 0.5 * convexity * dr**2
+        return balance * (1 + pct_chg)
+
+    def project(
+        self,
+        positions: List[HQLAPosition],
+        scenarios: List[RateScenario],
+    ) -> List[HQLAProjectionResult]:
+        """
+        Project HQLA balances under multiple rate scenarios.
+
+        Returns
+        -------
+        list of HQLAProjectionResult, one per scenario.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("Call fit() first.")
+
+        # Base trend forecasts from Prophet
+        base: Dict[str, List[float]] = {}
+        dates: List[str] = []
+        for col, m in self._models.items():
+            future = m.make_future_dataframe(periods=self.horizon_days)
+            fc     = m.predict(future)
+            base[col] = fc["yhat"].clip(lower=0).tolist()
+            if not dates:
+                dates = fc["ds"].dt.strftime("%Y-%m-%d").tolist()
+
+        results = []
+        for sc in scenarios:
+            l1_proj, l2a_proj, l2b_proj, total_proj, haircut_pct = [], [], [], [], []
+
+            # Compute portfolio-level duration from positions by tier
+            def wt_duration(tier: str) -> float:
+                ps = [p for p in positions if tier in p.asset_type]
+                tot = sum(p.balance_usd_m for p in ps)
+                if tot == 0:
+                    return 0.0
+                return sum(p.balance_usd_m * p.duration_years for p in ps) / tot
+
+            def wt_convexity(tier: str) -> float:
+                ps = [p for p in positions if tier in p.asset_type]
+                tot = sum(p.balance_usd_m for p in ps)
+                if tot == 0:
+                    return 0.0
+                return sum(p.balance_usd_m * p.convexity for p in ps) / tot
+
+            dur_l1  = wt_duration("L1")
+            dur_l2a = wt_duration("L2A")
+            dur_l2b = wt_duration("L2B")
+            cvx_l1  = wt_convexity("L1")
+            cvx_l2a = wt_convexity("L2A")
+            cvx_l2b = wt_convexity("L2B")
+
+            for i in range(len(dates)):
+                b_l1  = base["l1_balance"][i]
+                b_l2a = base["l2a_balance"][i]
+                b_l2b = base["l2b_balance"][i]
+
+                # Apply rate shock fair value adjustment
+                sv_l1  = self._apply_rate_shock(b_l1,  dur_l1,  cvx_l1,  sc.parallel_shift_bps)
+                sv_l2a = self._apply_rate_shock(b_l2a, dur_l2a, cvx_l2a, sc.parallel_shift_bps)
+                sv_l2b = self._apply_rate_shock(b_l2b, dur_l2b, cvx_l2b,
+                                                sc.parallel_shift_bps + sc.credit_shock_bps)
+
+                # Apply Basel III haircuts
+                el1  = sv_l1  * (1 - HQLA_HAIRCUTS.get("L1_sovereign_0pct_rw", 0))
+                el2a = sv_l2a * (1 - HQLA_HAIRCUTS.get("L2A_sovereign_20pct_rw", 0.15))
+                el2b = sv_l2b * (1 - HQLA_HAIRCUTS.get("L2B_corporate_bonds_A",  0.50))
+
+                total = el1 + el2a + el2b
+                raw_haircut = 1 - (total / max(b_l1 + b_l2a + b_l2b, 1e-6))
+
+                l1_proj.append(round(el1, 2))
+                l2a_proj.append(round(el2a, 2))
+                l2b_proj.append(round(el2b, 2))
+                total_proj.append(round(total, 2))
+                haircut_pct.append(round(raw_haircut * 100, 2))
+
+            results.append(HQLAProjectionResult(
+                scenario      = sc.label,
+                horizon_days  = self.horizon_days,
+                dates         = dates,
+                l1_projected  = l1_proj,
+                l2a_projected = l2a_proj,
+                l2b_projected = l2b_proj,
+                total_hqla    = total_proj,
+                rate_haircut_pct = haircut_pct,
+            ))
+        return results
